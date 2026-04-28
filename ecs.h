@@ -150,7 +150,6 @@ static void __ecs_component_storage_init(
     __ECS_ComponentStorage *s,
     size_t component_size
 );
-static void __ecs_component_storage_free(__ECS_ComponentStorage *s);
 static void __ecs_component_storage_reserve_dense(
     __ECS_ComponentStorage *s,
     uint32_t new_capacity
@@ -165,10 +164,6 @@ static bool __ecs_component_storage_has(
 );
 static void *__ecs_component_storage_get(
     __ECS_ComponentStorage *s,
-    Entity entity
-);
-static const void *__ecs_component_storage_get_const(
-    const __ECS_ComponentStorage *s,
     Entity entity
 );
 static void *__ecs_component_storage_add_uninitialized(
@@ -243,11 +238,39 @@ void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb);
 // ############################ SYSTEM ###############################
 typedef void(*__ECS_SystemFn)(World*);
 typedef struct {
+    const char** names;
+    const size_t count;
+} __ECS_SystemDependencyListBefore;
+typedef struct {
+    const char** names;
+    const size_t count;
+} __ECS_SystemDependencyListAfter;
+
+typedef struct {
     const char * system_name;
-    __ECS_SystemFn system_fn;
+    const __ECS_SystemFn system_fn;
     const __ECS_ComponentID* system_query;
     const size_t query_len;
+    const __ECS_SystemDependencyListBefore deps_before;
+    const __ECS_SystemDependencyListAfter deps_after;
 } __ECS_SystemDescription;
+
+typedef struct {
+    const __ECS_SystemDescription** systems;
+    uint32_t count;
+} __ECS_ScheduleBatch;
+
+typedef struct {
+    __ECS_ScheduleBatch* batches;
+    uint32_t count;
+} __ECS_Schedule;
+
+typedef enum {
+    __ECS_SCHEDULE_OK,
+    __ECS_SCHEDULE_ERROR_OUT_OF_MEMORY,
+    __ECS_SCHEDULE_ERROR_MISSING_DEPENDENCY,
+    __ECS_SCHEDULE_ERROR_CYCLE,
+} __ECS_ScheduleResult;
 
 #define __ECS_SECTION __attribute__((section("__ECS_SYSTEM"), used))
 #define __ECS_GET_COMPONENT_SIGNATURE_IMPL(ty, ident) ty* ident
@@ -256,11 +279,30 @@ typedef struct {
 #define __ECS_GET_COMPONENT_ID(ty_ident) __ECS_GET_COMPONENT_ID_IMPL ty_ident 
 #define __ECS_GET_COMPONENT_TYPE(ty, ident) (ty*)
 #define __ECS_GET_COMPONENT_STORAGE(ty, ident) &world->components[__ECS_COMPONENT_ID(ty)]
-#define __ECS_GET_COMPONENT_REF(ty_ident) \
-    __ECS_GET_COMPONENT_TYPE ty_ident \
+#define __ECS_GET_COMPONENT_REF(ty_ident)                                              \
+    __ECS_GET_COMPONENT_TYPE ty_ident                                                  \
     __ecs_component_storage_get( __ECS_GET_COMPONENT_STORAGE ty_ident, entity)
+#define __ECS_ARRAY_COUNT(x) ((sizeof(x)) / sizeof(x[0]))
+#define __ECS_STRINGIFY_ARG(x) #x
+#define __ECS_CREATE_DEP_NAMES(...) (const char *[]){                                  \
+        __VA_OPT__(__ECS_FOR_EACH_COMMA(__ECS_STRINGIFY_ARG, __VA_ARGS__),)            \
+        NULL                                                                           \
+    }
+#define __ECS_CREATE_DEP_COUNT(...) 0 __VA_OPT__(+ __ECS_ARRAY_COUNT((const char *[]){ \
+        __ECS_FOR_EACH_COMMA(__ECS_STRINGIFY_ARG, __VA_ARGS__)                         \
+    }))
+#define ECS_BEFORE(...)                                                                \
+    ((__ECS_SystemDependencyListBefore){                                                \
+        .names = __ECS_CREATE_DEP_NAMES(__VA_ARGS__),                                  \
+        .count = __ECS_CREATE_DEP_COUNT(__VA_ARGS__)                                   \
+    })
+#define ECS_AFTER(...)                                                                 \
+    ((__ECS_SystemDependencyListAfter){                                               \
+        .names = __ECS_CREATE_DEP_NAMES(__VA_ARGS__),                                  \
+        .count = __ECS_CREATE_DEP_COUNT(__VA_ARGS__)                                   \
+    })
 
-#define ECS_SYSTEM(name, ...)                                                                                             \
+#define ECS_SYSTEM_DEPENDS(name, before, after, ...)                                                                      \
     static void name##_impl(World* world, Entity this, __ECS_FOR_EACH_COMMA(__ECS_GET_COMPONENT_SIGNATURE, __VA_ARGS__)); \
     static const __ECS_ComponentID name##_query[] = {                                                                     \
         __ECS_FOR_EACH(__ECS_GET_COMPONENT_ID, __VA_ARGS__)                                                               \
@@ -292,8 +334,24 @@ typedef struct {
         .system_fn = name,                                                                                                \
         .system_query = name##_query,                                                                                     \
         .query_len = sizeof(name##_query) / sizeof(name##_query[0]),                                                      \
+        .deps_before = before,                                                                                            \
+        .deps_after = after,                                                                                              \
     };                                                                                                                    \
     static void name##_impl(World* world, Entity this, __ECS_FOR_EACH_COMMA(__ECS_GET_COMPONENT_SIGNATURE, __VA_ARGS__))
+
+#define ECS_SYSTEM(name, ...) ECS_SYSTEM_DEPENDS(name, ECS_BEFORE(), ECS_AFTER() __VA_OPT__(,) __VA_ARGS__) 
+
+static int __ecs_find_system_index(
+    const __ECS_SystemDescription *systems,
+    uint32_t system_count,
+    const char *name
+);
+
+static __ECS_ScheduleResult __ecs_build_schedule(
+    const __ECS_SystemDescription *systems,
+    uint32_t system_count,
+    __ECS_Schedule *out_schedule
+);
 
 // ############################ SYSTEM ###############################
 
@@ -323,19 +381,20 @@ struct World_s {
     __ECS_ComponentStorage components[__ECS_COMPONENT_ID_COUNT];                             
     __ECS_CommandBuffer cmd_buffer;                                                          
     Entity next_entity;                                                                      
-    int TODO;                                                                                
+    __ECS_Schedule schedule;
 };
 
 void world_run(World* world)
 {
-    __ecs_command_buffer_drain(world, &world->cmd_buffer);
-    extern const __ECS_SystemDescription __start___ECS_SYSTEM[];
-    extern const __ECS_SystemDescription __stop___ECS_SYSTEM[];
-    for (const __ECS_SystemDescription *s = __start___ECS_SYSTEM;
-        s < __stop___ECS_SYSTEM;
-        s++)
+    for (int i = 0; i < world->schedule.count; i++)
     {
-        s->system_fn(world);
+        __ecs_command_buffer_drain(world, &world->cmd_buffer);
+        __ECS_ScheduleBatch* batch = &world->schedule.batches[i];
+        // TODO: run each batch in parallel.
+        for (int j = 0; j < batch->count; j++)
+        {
+            batch->systems[j]->system_fn(world);
+        }
     }
 }
 
@@ -345,6 +404,17 @@ World world_init(void)
 #define __ECS_INIT_COMPONENT_STORAGE(ty) \
     __ecs_component_storage_init(&world.components[__ECS_COMPONENT_ID(ty)], sizeof(ty));                                    
     ECS_IMPL_COMPONENTS(__ECS_INIT_COMPONENT_STORAGE)
+    extern const __ECS_SystemDescription __start___ECS_SYSTEM[];
+    extern const __ECS_SystemDescription __stop___ECS_SYSTEM[];
+
+
+    __ECS_ScheduleResult result = __ecs_build_schedule(__start___ECS_SYSTEM, __stop___ECS_SYSTEM - __start___ECS_SYSTEM, &world.schedule);
+    if (result != __ECS_SCHEDULE_OK)
+    {
+        printf("Scheduling Error: %d\n", result);
+    }
+    assert(result == __ECS_SCHEDULE_OK);
+
     return world;
 }
 
@@ -379,21 +449,6 @@ static void __ecs_component_storage_init(
     s->sparse_capacity = 0;
 
     s->component_size = component_size;
-}
-
-static void __ecs_component_storage_free(__ECS_ComponentStorage *s) {
-    free(s->entities);
-    free(s->components);
-    free(s->sparse);
-
-    s->entities = NULL;
-    s->components = NULL;
-    s->sparse = NULL;
-
-    s->count = 0;
-    s->capacity = 0;
-    s->sparse_capacity = 0;
-    s->component_size = 0;
 }
 
 static void __ecs_component_storage_reserve_dense(
@@ -484,19 +539,6 @@ static void *__ecs_component_storage_get(
     uint32_t dense_index = s->sparse[entity];
 
     return (char *)s->components + dense_index * s->component_size;
-}
-
-static const void *__ecs_component_storage_get_const(
-    const __ECS_ComponentStorage *s,
-    Entity entity
-) {
-    if (!__ecs_component_storage_has(s, entity)) {
-        return NULL;
-    }
-
-    uint32_t dense_index = s->sparse[entity];
-
-    return (const char *)s->components + dense_index * s->component_size;
 }
 
 static void *__ecs_component_storage_add_uninitialized(
@@ -716,7 +758,276 @@ void __ecs_command_buffer_destroy_entity(__ECS_CommandBuffer* cb, Entity e)
 // ########################### COMMANDS #############################
 
 // ############################ SYSTEM ###############################
-/* None */
+static int __ecs_find_system_index(
+    const __ECS_SystemDescription *systems,
+    uint32_t system_count,
+    const char *name
+) {
+    for (uint32_t i = 0; i < system_count; i++) {
+        if (strcmp(systems[i].system_name, name) == 0) {
+            return (int)i;
+        }
+    }
+
+    return -1;
+}
+
+static const __ECS_SystemDescription* __ecs_schedule_batch_get_system(const __ECS_ScheduleBatch* self, size_t idx)
+{
+    if (self == NULL) return NULL;
+    if (idx >= self->count) return NULL;
+
+    return self->systems[idx];
+}
+
+static const __ECS_ComponentID* __ecs_system_get_query(const __ECS_SystemDescription* self)
+{
+    if (self == NULL) return NULL;
+    return self->system_query;
+}
+
+static const size_t __ecs_system_get_query_len(const __ECS_SystemDescription* self)
+{
+    if (self == NULL) return 0;
+    return self->query_len;
+}
+
+static __ECS_ScheduleResult __ecs_build_schedule(
+    const __ECS_SystemDescription *systems,
+    uint32_t system_count,
+    __ECS_Schedule *out_schedule
+) {
+    
+
+    out_schedule->batches = NULL;
+    out_schedule->count = 0;
+
+    if (system_count == 0) {
+        return __ECS_SCHEDULE_OK;
+    }
+
+    uint8_t *edges = calloc(system_count * system_count, sizeof(uint8_t));
+    uint32_t *in_degree = calloc(system_count, sizeof(uint32_t));
+    uint8_t *scheduled = calloc(system_count, sizeof(uint8_t));
+    
+    __ECS_ScheduleBatch *batches =
+        malloc(sizeof(__ECS_ScheduleBatch) * system_count);
+
+    if (!edges || !in_degree || !scheduled || !batches) {
+        free(edges);
+        free(in_degree);
+        free(scheduled);
+        free(batches);
+        return __ECS_SCHEDULE_ERROR_OUT_OF_MEMORY;
+    }
+    
+    for (uint32_t i = 0; i < system_count; i++) {
+        batches[i].systems = NULL;
+        batches[i].count = 0;
+    }
+#define ECS_ADD_EDGE(from, to)                                      \
+    do {                                                           \
+        uint32_t __from = (uint32_t)(from);                        \
+        uint32_t __to = (uint32_t)(to);                            \
+        uint32_t __edge_index = __from * system_count + __to;      \
+                                                                   \
+        if (!edges[__edge_index]) {                                \
+            edges[__edge_index] = 1;                               \
+            in_degree[__to]++;                                     \
+        }                                                          \
+    } while (0)
+
+    
+
+    for (uint32_t system_index = 0; system_index < system_count; system_index++) {
+        const __ECS_SystemDescription* system = &systems[system_index];
+
+
+        for (uint32_t i = 0; i < system->deps_after.count; i++) {
+            int dep_index = __ecs_find_system_index(
+                systems,
+                system_count,
+                system->deps_after.names[i]
+            );
+            if (dep_index < 0) {
+                free(edges);
+                free(in_degree);
+                free(scheduled);
+                free(batches);
+                return __ECS_SCHEDULE_ERROR_MISSING_DEPENDENCY;
+            }
+
+            /* system after dep => dep -> system */
+            ECS_ADD_EDGE(dep_index, system_index);
+            do {
+                uint32_t __from = (uint32_t)(dep_index);
+                uint32_t __to = (uint32_t)(system_index);
+                uint32_t __edge_index = __from * system_count + __to;
+
+                if (!edges[__edge_index]) {
+                    edges[__edge_index] = 1;
+                    in_degree[__to]++;
+                }
+            } while (0);
+        }
+
+        for (uint32_t i = 0; i < system->deps_before.count; i++) {
+            int dep_index = __ecs_find_system_index(
+                systems,
+                system_count,
+                system->deps_before.names[i]
+            );
+            if (dep_index < 0) {
+                free(edges);
+                free(in_degree);
+                free(scheduled);
+                free(batches);
+                return __ECS_SCHEDULE_ERROR_MISSING_DEPENDENCY;
+            }
+
+            /* system before dep => system -> dep */
+            ECS_ADD_EDGE(system_index, dep_index);
+        }
+    }
+
+#undef ECS_ADD_EDGE
+
+    uint32_t scheduled_count = 0;
+    uint32_t batch_count = 0;
+
+    while (scheduled_count < system_count) {
+        uint32_t ready_count = 0;
+
+        for (uint32_t i = 0; i < system_count; i++) {
+            if (!scheduled[i] && in_degree[i] == 0) {
+                ready_count++;
+            }
+        }
+
+        if (ready_count == 0) {
+            free(edges);
+            free(in_degree);
+            free(scheduled);
+
+            for (uint32_t i = 0; i < batch_count; i++) {
+                free((void *)batches[i].systems);
+            }
+
+            free(batches);
+
+            return __ECS_SCHEDULE_ERROR_CYCLE;
+        }
+
+
+        const __ECS_SystemDescription **ready_systems =
+            malloc(sizeof(__ECS_SystemDescription *) * ready_count);
+
+        if (!ready_systems) {
+            free(edges);
+            free(in_degree);
+            free(scheduled);
+
+            for (uint32_t i = 0; i < batch_count; i++) {
+                free((void *)batches[i].systems);
+            }
+
+            free(batches);
+            return __ECS_SCHEDULE_ERROR_OUT_OF_MEMORY;
+        }
+
+        uint32_t out = 0;
+
+        for (uint32_t i = 0; i < system_count; i++) {
+            if (!scheduled[i] && in_degree[i] == 0) {
+                ready_systems[out++] = &systems[i];
+                scheduled[i] = 1;
+            }
+        }
+
+        batches[batch_count].systems = ready_systems;
+        batches[batch_count].count = ready_count;
+        batch_count++;
+
+        /*
+            Remove outgoing edges from all systems in this batch.
+
+            Important: we remove edges after collecting the whole batch.
+            That prevents a system unlocked by another system in the same
+            pass from being included in the same batch.
+        */
+        for (uint32_t r = 0; r < ready_count; r++) {
+            const __ECS_SystemDescription *ready = ready_systems[r];
+
+            int from = __ecs_find_system_index(
+                systems,
+                system_count,
+                ready->system_name
+            );
+
+            for (uint32_t to = 0; to < system_count; to++) {
+                uint32_t edge_index = (uint32_t)from * system_count + to;
+
+                if (edges[edge_index]) {
+                    edges[edge_index] = 0;
+                    in_degree[to]--;
+                }
+            }
+
+            scheduled_count++;
+        }
+    }
+
+    free(edges);
+    free(in_degree);
+    free(scheduled);
+
+    __ECS_ScheduleBatch *shrunk =
+        realloc(batches, sizeof(__ECS_ScheduleBatch) * batch_count);
+
+    if (shrunk) {
+        batches = shrunk;
+    }
+
+    out_schedule->batches = batches;
+    out_schedule->count = batch_count;
+
+    for (int i = 0; i < out_schedule->count; i++)
+    {
+        __ECS_ScheduleBatch* batch = &out_schedule->batches[i];
+        
+        for (int sys_idx0 = 0; sys_idx0 < batch->count - 1; sys_idx0++)
+        {
+            const __ECS_SystemDescription* sys = __ecs_schedule_batch_get_system(batch, sys_idx0);
+            const __ECS_ComponentID* sys_query = __ecs_system_get_query(sys);
+            const size_t sys_query_len = __ecs_system_get_query_len(sys);
+            for (int sys_idx1 = sys_idx0 + 1; sys_idx1 < batch->count; sys_idx1++)
+            {
+                const __ECS_SystemDescription* sys2 = __ecs_schedule_batch_get_system(batch, sys_idx1);
+                const __ECS_ComponentID* sys2_query = __ecs_system_get_query(sys2);
+                const size_t sys2_query_len = __ecs_system_get_query_len(sys2);
+
+                for (int q1 = 0; q1 < sys_query_len; q1++)
+                {
+                    for (int q2 = 0; q2 < sys2_query_len; q2++)
+                    {
+
+                        if (sys_query[q1] == sys2_query[q2])
+                        {
+                            printf("Unspecified dependency between systems `%s` and `%s`.\n", sys->system_name, sys2->system_name);
+                            printf("Both utilize component `%s`.\n", __ecs_component_id_names[sys_query[q1]]);
+                            assert(0);
+                        }
+                    }
+                }
+                
+
+            }
+        }
+
+    }
+
+    return __ECS_SCHEDULE_OK;
+}
 // ############################ SYSTEM ###############################
 
 #endif
