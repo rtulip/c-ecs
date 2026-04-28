@@ -15,103 +15,66 @@ typedef struct {
 
 typedef struct {
     size_t count;
+    size_t by;
 } Counter;
 
 typedef struct {
-    enum {
-        SHAPE_CIRCLE,
-        SHAPE_RECT,
-    } kind;
-    union {
-        float radius;
-        struct {
-            float width;
-            float height;
-        } dimensions; 
-    };
-} Shape; 
+} Spawner;
+typedef struct {
+} Volatile;
 
 #define COMPONENTS(DO) \
     DO(Position) \
     DO(Velocity) \
-    DO(Shape) \
     DO(Counter) \
+    DO(Spawner) \
+    DO(Volatile)
 
 ECS_CREATE_WORLD(COMPONENTS)
 
-ECS_SYSTEM(movement, (Velocity, v), (Position, p))
+ECS_SYSTEM(spawner, (Spawner, s))
 {
-    p->x += v->dx;
-    p->y += v->dy;
+    Entity e = world_create_entity(world);
+    entity_add_component(Counter)(world, e, (Counter){0, e});
+    entity_add_component(Volatile)(world, e, (Volatile){});
+    printf("Spawning Entity %u\n", e);
 }
 
 ECS_SYSTEM(counter, (Counter, c))
 {
-    c->count++;
+    c->count += c->by;
 }
-
-ECS_SYSTEM(friction, (Velocity, v))
-{
-    if (v->dx > 0.1)
-    {
-        v->dx -= 0.01;
-    }
-    else if (v->dx < -0.1)
-    {
-        v->dx += 0.01;
-    }
-    else
-    {
-        v->dx = 0; 
-    }
-
-    if (v->dy > 0.1)
-    {
-        v->dy -= 0.01;
-    }
-    else if (v->dy < -0.1)
-    {
-        v->dy += 0.01;
-    }
-    else
-    {
-        v->dy = 0; 
-    }
-}
-
-ECS_SYSTEM(debug_movement, (Velocity, v), (Position, p))
-{
-    printf("e%u: P: (%f, %f) V: (%f, %f)\n", this, p->x, p->y, v->dx, v->dy);
-}
-
 ECS_SYSTEM(debug_counter, (Counter, c))
 {
-    printf("e%u: C: %lu\n", this, c->count);
+    printf("e%u: Count: %lu\n", this, c->count);
+}
+
+ECS_SYSTEM(counter_destroyer, (Counter, c), (Volatile, v))
+{
+    if (c->count >= 5)
+    {
+        printf("e%u: Destroying entity because it's volatile\n", this);
+        entity_destroy(world, this);
+    }
+}
+
+ECS_SYSTEM(debug_volatile, (Volatile, v))
+{
+    printf("e%u is Volatile\n", this);
 }
 
 int main(){
     
     World w = world_init();
 
-    Entity e = world_create_entity(&w);
-    ecs_world_add(Position)(&w, e, (Position){.x = 3, .y = 4});
-    ecs_world_add(Velocity)(&w, e, (Velocity){.dx = -2, .dy = 1});
-    ecs_world_add(Counter)(&w, e, (Counter){3});
-
-    e = world_create_entity(&w);
-    ecs_world_add(Position)(&w, e, (Position){0, 0});
-    ecs_world_add(Counter)(&w, e, (Counter){0});
-
-    for (int i = 0; i < 3; i++)
-    {
-        world_run(&w);
-    }
-    printf("-----------\n");
-    ecs_world_add(Velocity)(&w, e, (Velocity){1,1});
-    for (int i = 0; i < 3; i++)
-    {
-        world_run(&w);
+    { 
+        Entity e = world_create_entity(&w);
+        entity_add_component(Spawner)(&w, e, (Spawner){});
     }
     
-
+    for (int i = 0; i < 10; i++)
+    {
+        world_run(&w);
+        printf("===============\n");
+    }
 }
