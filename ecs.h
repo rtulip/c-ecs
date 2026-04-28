@@ -218,7 +218,10 @@ typedef struct {
     size_t start;
 } __ECS_CommandBuffer;
 
+#define entity_add_component(ty) entity_add_component_##ty
+#define entity_remove_component(ty) entity_remove_component_##ty
 void* __ecs_command_buffer_pop(__ECS_CommandBuffer* cb, size_t size);
+void __ecs_command_buffer_push(__ECS_CommandBuffer* cb, void* data, size_t len);
 void __ecs_command_buffer_destroy_entity(__ECS_CommandBuffer* cb, Entity e);
 void __ecs_command_buffer_add_component(
     __ECS_CommandBuffer* cb, 
@@ -237,6 +240,7 @@ void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb);
 
 // ########################### COMMANDS #############################
 
+// ############################ SYSTEM ###############################
 typedef void(*__ECS_SystemFn)(World*);
 typedef struct {
     const char * system_name;
@@ -246,178 +250,6 @@ typedef struct {
 } __ECS_SystemDescription;
 
 #define __ECS_SECTION __attribute__((section("__ECS_SYSTEM"), used))
-#define __ECS_COMPONENT_ID(ty) COMPONENT_ID_##ty
-#define __ECS_GENERATE_COMPONENT_ID(ty) __ECS_COMPONENT_ID(ty),
-#define __ECS_INIT_COMPONENT_STORAGE(ty)                                                                                 \
-    __ecs_component_storage_init(&world.components[__ECS_COMPONENT_ID(ty)], sizeof(ty));
-
-#define entity_add_component(ty) entity_add_component_##ty
-#define entity_remove_component(ty) entity_remove_component_##ty
-#define __ECS_GENERATE_ADD_COMPONENT_FN(ty)                                                                    \
-    void entity_add_component(ty)(World* world, Entity e, ty value)                                            \
-    {                                                                                                          \
-        __ecs_command_buffer_add_component(&world->cmd_buffer, e, __ECS_COMPONENT_ID(ty), &value, sizeof(ty)); \
-    }                                                                                                          \
-    void entity_remove_component(ty)(World* world, Entity e)                                                   \
-    {                                                                                                          \
-        __ecs_command_buffer_remove_component(&world->cmd_buffer, e, __ECS_COMPONENT_ID(ty));                  \
-    }
-
-#define __ECS_GENERATE_COMPONENT_ID_STRINGS(ty) "COMPONENT_ID_" #ty,
-#define __ECS_COMPONENT_ID_STRING(ty) __ecs_component_id_names[__ECS_COMPONENT_ID(ty)]
-
-#define __ECS_CASE_HANDLE_ADD_COMPONENT(ty)                                                                              \
-    case __ECS_COMPONENT_ID(ty):                                                                                         \
-    {                                                                                                                    \
-        __ECS_ComponentStorage* storage = &world->components[__ECS_COMPONENT_ID(ty)];                                    \
-        __ecs_component_storage_add(storage, cmd.entity, __ecs_command_buffer_pop(cb, sizeof(ty)));                      \
-    }                                                                                                                    \
-    break;
-
-void __ecs_world_destory_entity_immediate(World* world, Entity e);
-
-#define ECS_CREATE_WORLD(FOR_EACH_COMPONENT)                                                     \
-    enum __ECS_ComponentID_e {                                                                   \
-        FOR_EACH_COMPONENT(__ECS_GENERATE_COMPONENT_ID)                                          \
-        __ECS_COMPONENT_ID_COUNT,                                                                \
-    };                                                                                           \
-    struct World_s {                                                                             \
-        __ECS_ComponentStorage components[__ECS_COMPONENT_ID_COUNT];                             \
-        __ECS_CommandBuffer cmd_buffer;                                                          \
-        Entity next_entity;                                                                      \
-        int TODO;                                                                                \
-    };                                                                                           \
-    FOR_EACH_COMPONENT(__ECS_GENERATE_ADD_COMPONENT_FN)                                          \
-    const char* __ecs_component_id_names[] = {                                                   \
-        FOR_EACH_COMPONENT(__ECS_GENERATE_COMPONENT_ID_STRINGS)                                  \
-    };                                                                                           \
-    void world_run(World* world)                                                                 \
-    {                                                                                            \
-        __ecs_command_buffer_drain(world, &world->cmd_buffer);                                   \
-                                                                                                 \
-        extern const __ECS_SystemDescription __start___ECS_SYSTEM[];                             \
-        extern const __ECS_SystemDescription __stop___ECS_SYSTEM[];                              \
-        for (const __ECS_SystemDescription *s = __start___ECS_SYSTEM;                            \
-            s < __stop___ECS_SYSTEM;                                                             \
-            s++)                                                                                 \
-        {                                                                                        \
-            s->system_fn(world);                                                                 \
-        }                                                                                        \
-    }                                                                                            \
-    World world_init(void)                                                                       \
-    {                                                                                            \
-        World world = {0};                                                                       \
-        FOR_EACH_COMPONENT(__ECS_INIT_COMPONENT_STORAGE)                                         \
-        return world;                                                                            \
-    }                                                                                            \
-    Entity world_create_entity(World* world)                                                     \
-    {                                                                                            \
-        return world->next_entity++;                                                             \
-    }                                                                                            \
-    static bool __ecs_entity_matches_query(                                                      \
-        __ECS_ComponentStorage* components,                                                      \
-        Entity entity,                                                                           \
-        const __ECS_ComponentID *query,                                                          \
-        uint32_t query_count                                                                     \
-    ) {                                                                                          \
-        for (uint32_t i = 0; i < query_count; i++) {                                             \
-            if (!__ecs_component_storage_has(                                                    \
-                &components[query[i]],                                                           \
-                entity                                                                           \
-            )) {                                                                                 \
-                return false;                                                                    \
-            }                                                                                    \
-        }                                                                                        \
-                                                                                                 \
-        return true;                                                                             \
-    }                                                                                            \
-    void __ecs_command_buffer_add_component(                                                     \
-        __ECS_CommandBuffer* cb,                                                                 \
-        Entity e,                                                                                \
-        __ECS_ComponentID id,                                                                    \
-        void* component_data,                                                                    \
-        size_t component_size                                                                    \
-    )                                                                                            \
-    {                                                                                            \
-        __ECS_Command cmd = {                                                                    \
-            .data_size = component_size + sizeof(id),                                            \
-            .kind = __ECS_COMMAND_ADD_COMPONENT,                                                 \
-            .entity = e,                                                                         \
-        };                                                                                       \
-        __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));                                        \
-        __ecs_command_buffer_push(cb, &id, sizeof(id));                                          \
-        __ecs_command_buffer_push(cb, component_data, component_size);                           \
-    }                                                                                            \
-    void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb)          \
-    {                                                                                            \
-        switch (cmd.kind)                                                                        \
-        {                                                                                        \
-            case __ECS_COMMAND_DESTORY_ENTITY:                                                   \
-            {                                                                                    \
-                __ecs_world_destory_entity_immediate(world, cmd.entity);                         \
-            }                                                                                    \
-            break;                                                                               \
-            case __ECS_COMMAND_ADD_COMPONENT:                                                    \
-            {                                                                                    \
-                __ECS_ComponentID* id = __ecs_command_buffer_pop(cb, sizeof(__ECS_ComponentID)); \
-                __ECS_ComponentStorage* storage = &world->components[*id];                       \
-                __ecs_component_storage_add(                                                     \
-                    storage,                                                                     \
-                    cmd.entity,                                                                  \
-                    __ecs_command_buffer_pop(cb, storage->component_size)                        \
-                );                                                                               \
-            }                                                                                    \
-            break;                                                                               \
-            case __ECS_COMMAND_REMOVE_COMPONENT:                                                 \
-            {                                                                                    \
-                __ECS_ComponentID* id = __ecs_command_buffer_pop(cb, sizeof(__ECS_ComponentID)); \
-                __ECS_ComponentStorage* storage = &world->components[*id];                       \
-                __ecs_component_storage_remove(                                                  \
-                    storage,                                                                     \
-                    cmd.entity                                                                   \
-                );                                                                               \
-            }                                                                                    \
-            break;                                                                               \
-            default:                                                                             \
-                assert(0 && "UNKNOWN COMMAND");                                                  \
-        }                                                                                        \
-    }                                                                                            \
-    void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb)                       \
-    {                                                                                            \
-        while (cb->start < cb->size)                                                             \
-        {                                                                                        \
-            __ECS_Command* cmd = __ecs_command_buffer_pop(cb, sizeof(__ECS_Command));            \
-            __ecs_command_handle(world, *cmd, cb);                                               \
-        }                                                                                        \
-    }                                                                                            \
-    void __ecs_command_buffer_remove_component(                                                  \
-        __ECS_CommandBuffer* cb,                                                                 \
-        Entity e,                                                                                \
-        __ECS_ComponentID id                                                                     \
-    )                                                                                            \
-    {                                                                                            \
-        __ECS_Command cmd = {                                                                    \
-            .data_size = sizeof(id),                                                             \
-            .kind = __ECS_COMMAND_REMOVE_COMPONENT,                                              \
-            .entity = e,                                                                         \
-        };                                                                                       \
-        __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));                                        \
-        __ecs_command_buffer_push(cb, &id, sizeof(id));                                          \
-    }                                                                                            \
-    void __ecs_world_destory_entity_immediate(World* world, Entity e) \
-    { \
-        for (__ECS_ComponentStorage* storage = world->components; \
-             storage < &world->components[__ECS_COMPONENT_ID_COUNT]; \
-             storage++) \
-        {\
-            __ecs_component_storage_remove(storage, e); \
-        } \
-    } \
-    void entity_destroy(World* world, Entity e) \
-    { \
-        __ecs_command_buffer_destroy_entity(&world->cmd_buffer, e);\
-    }
-
 #define __ECS_GET_COMPONENT_SIGNATURE_IMPL(ty, ident) ty* ident
 #define __ECS_GET_COMPONENT_SIGNATURE(ty_ident) __ECS_GET_COMPONENT_SIGNATURE_IMPL ty_ident
 #define __ECS_GET_COMPONENT_ID_IMPL(ty, ident) __ECS_GENERATE_COMPONENT_ID(ty)
@@ -463,10 +295,77 @@ void __ecs_world_destory_entity_immediate(World* world, Entity e);
     };                                                                                                                    \
     static void name##_impl(World* world, Entity this, __ECS_FOR_EACH_COMMA(__ECS_GET_COMPONENT_SIGNATURE, __VA_ARGS__))
 
+// ############################ SYSTEM ###############################
+
+// ############################ WORLD ###############################
+void __ecs_world_destory_entity_immediate(World* world, Entity e);
+// ############################ WORLD ###############################
+
+
 #endif
 
-#ifdef ECS_IMPL
+#ifdef ECS_IMPL_COMPONENTS
 
+// ############################ WORLD ###############################
+#define __ECS_COMPONENT_ID(ty) COMPONENT_ID_##ty
+#define __ECS_GENERATE_COMPONENT_ID(ty) __ECS_COMPONENT_ID(ty),
+enum __ECS_ComponentID_e {
+    ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID)
+    __ECS_COMPONENT_ID_COUNT,
+};
+
+#define __ECS_GENERATE_COMPONENT_ID_STRINGS(ty) "COMPONENT_ID_" #ty,
+const char* __ecs_component_id_names[] = {                                                   
+    ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID_STRINGS)                                  
+};
+
+struct World_s {                                                                             
+    __ECS_ComponentStorage components[__ECS_COMPONENT_ID_COUNT];                             
+    __ECS_CommandBuffer cmd_buffer;                                                          
+    Entity next_entity;                                                                      
+    int TODO;                                                                                
+};
+
+void world_run(World* world)
+{
+    __ecs_command_buffer_drain(world, &world->cmd_buffer);
+    extern const __ECS_SystemDescription __start___ECS_SYSTEM[];
+    extern const __ECS_SystemDescription __stop___ECS_SYSTEM[];
+    for (const __ECS_SystemDescription *s = __start___ECS_SYSTEM;
+        s < __stop___ECS_SYSTEM;
+        s++)
+    {
+        s->system_fn(world);
+    }
+}
+
+World world_init(void)
+{                                                                       
+    World world = {0};    
+#define __ECS_INIT_COMPONENT_STORAGE(ty) \
+    __ecs_component_storage_init(&world.components[__ECS_COMPONENT_ID(ty)], sizeof(ty));                                    
+    ECS_IMPL_COMPONENTS(__ECS_INIT_COMPONENT_STORAGE)
+    return world;
+}
+
+Entity world_create_entity(World* world)
+{
+    return world->next_entity++;
+}
+
+void __ecs_world_destory_entity_immediate(World* world, Entity e)
+{
+    for (__ECS_ComponentStorage* storage = world->components;
+            storage < &world->components[__ECS_COMPONENT_ID_COUNT];
+            storage++)
+    {
+        __ecs_component_storage_remove(storage, e);
+    }
+}
+
+// ############################ WORLD ###############################
+
+// ############################ STORAGE #############################
 static void __ecs_component_storage_init(
     __ECS_ComponentStorage *s,
     size_t component_size
@@ -661,6 +560,121 @@ static void __ecs_component_storage_remove(
     s->sparse[entity] = ECS_INVALID_INDEX;
     s->count--;
 }
+// ############################ STORAGE #############################
+
+// ############################# QUERY ##############################
+static bool __ecs_entity_matches_query(                                                      
+    __ECS_ComponentStorage* components,                                                      
+    Entity entity,                                                                           
+    const __ECS_ComponentID *query,                                                          
+    uint32_t query_count                                                                     
+) {                                                                                          
+    for (uint32_t i = 0; i < query_count; i++) {                                             
+        if (!__ecs_component_storage_has(                                                    
+            &components[query[i]],                                                           
+            entity                                                                           
+        )) {                                                                                 
+            return false;                                                                    
+        }                                                                                    
+    }                                                                                        
+                                                                                                
+    return true;                                                                             
+}
+// ############################# QUERY ##############################
+
+// ########################### COMMANDS #############################
+#define __ECS_GENERATE_MODIFY_COMPONENT_FNS(ty)                                                                    \
+    void entity_add_component(ty)(World* world, Entity e, ty value)                                            \
+    {                                                                                                          \
+        __ecs_command_buffer_add_component(&world->cmd_buffer, e, __ECS_COMPONENT_ID(ty), &value, sizeof(ty)); \
+    }                                                                                                          \
+    void entity_remove_component(ty)(World* world, Entity e)                                                   \
+    {                                                                                                          \
+        __ecs_command_buffer_remove_component(&world->cmd_buffer, e, __ECS_COMPONENT_ID(ty));                  \
+    }
+
+ECS_IMPL_COMPONENTS(__ECS_GENERATE_MODIFY_COMPONENT_FNS)
+
+void __ecs_command_buffer_add_component(                                                     
+    __ECS_CommandBuffer* cb,                                                                 
+    Entity e,                                                                                
+    __ECS_ComponentID id,                                                                    
+    void* component_data,                                                                    
+    size_t component_size                                                                    
+)                                                                                            
+{                                                                                            
+    __ECS_Command cmd = {                                                                    
+        .data_size = component_size + sizeof(id),                                            
+        .kind = __ECS_COMMAND_ADD_COMPONENT,                                                 
+        .entity = e,                                                                         
+    };                                                                                       
+    __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));                                        
+    __ecs_command_buffer_push(cb, &id, sizeof(id));                                          
+    __ecs_command_buffer_push(cb, component_data, component_size);                           
+}                                                                                            
+void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb)          
+{                                                                                            
+    switch (cmd.kind)                                                                        
+    {                                                                                        
+        case __ECS_COMMAND_DESTORY_ENTITY:                                                   
+        {                                                                                    
+            __ecs_world_destory_entity_immediate(world, cmd.entity);                         
+        }                                                                                    
+        break;                                                                               
+        case __ECS_COMMAND_ADD_COMPONENT:                                                    
+        {                                                                                    
+            __ECS_ComponentID* id = __ecs_command_buffer_pop(cb, sizeof(__ECS_ComponentID)); 
+            __ECS_ComponentStorage* storage = &world->components[*id];                       
+            __ecs_component_storage_add(                                                     
+                storage,                                                                     
+                cmd.entity,                                                                  
+                __ecs_command_buffer_pop(cb, storage->component_size)                        
+            );                                                                               
+        }                                                                                    
+        break;                                                                               
+        case __ECS_COMMAND_REMOVE_COMPONENT:                                                 
+        {                                                                                    
+            __ECS_ComponentID* id = __ecs_command_buffer_pop(cb, sizeof(__ECS_ComponentID)); 
+            __ECS_ComponentStorage* storage = &world->components[*id];                       
+            __ecs_component_storage_remove(                                                  
+                storage,                                                                     
+                cmd.entity                                                                   
+            );                                                                               
+        }                                                                                    
+        break;                                                                               
+        default:                                                                             
+            assert(0 && "UNKNOWN COMMAND");                                                  
+    }                                                                                        
+}     
+                                                                                       
+void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb)                       
+{                                                                                            
+    while (cb->start < cb->size)                                                             
+    {                                                                                        
+        __ECS_Command* cmd = __ecs_command_buffer_pop(cb, sizeof(__ECS_Command));            
+        __ecs_command_handle(world, *cmd, cb);                                               
+    }                                                                                        
+}                                                                                            
+
+void __ecs_command_buffer_remove_component(                                                  
+    __ECS_CommandBuffer* cb,                                                                 
+    Entity e,                                                                                
+    __ECS_ComponentID id                                                                     
+)                                                                                            
+{                                                                                            
+    __ECS_Command cmd = {                                                                    
+        .data_size = sizeof(id),                                                             
+        .kind = __ECS_COMMAND_REMOVE_COMPONENT,                                              
+        .entity = e,                                                                         
+    };                                                                                       
+    __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));                                        
+    __ecs_command_buffer_push(cb, &id, sizeof(id));                                          
+}
+
+void entity_destroy(World* world, Entity e)
+{ 
+    __ecs_command_buffer_destroy_entity(&world->cmd_buffer, e);
+}
 
 void* __ecs_command_buffer_pop(__ECS_CommandBuffer* cb, size_t size)
 {
@@ -699,6 +713,10 @@ void __ecs_command_buffer_destroy_entity(__ECS_CommandBuffer* cb, Entity e)
     __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));
 }
 
+// ########################### COMMANDS #############################
 
+// ############################ SYSTEM ###############################
+/* None */
+// ############################ SYSTEM ###############################
 
 #endif

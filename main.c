@@ -1,7 +1,5 @@
 #include <stdio.h>
 #include <stdint.h>
-#define ECS_IMPL
-#include "ecs.h"
 
 typedef struct {
     float x;
@@ -23,14 +21,14 @@ typedef struct {
 typedef struct {
 } Volatile;
 
-#define COMPONENTS(DO) \
+#define ECS_IMPL_COMPONENTS(DO) \
     DO(Position) \
     DO(Velocity) \
     DO(Counter) \
     DO(Spawner) \
     DO(Volatile)
+#include "ecs.h"
 
-ECS_CREATE_WORLD(COMPONENTS)
 
 ECS_SYSTEM(spawner, (Spawner, s))
 {
