@@ -235,6 +235,11 @@ void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb);
 
 // ########################### COMMANDS #############################
 
+// ############################ WORLD ###############################
+#define __ECS_COMPONENT_ID(ty) COMPONENT_ID_##ty
+void __ecs_world_destory_entity_immediate(World* world, Entity e);
+// ############################ WORLD ###############################
+
 // ############################ SYSTEM ###############################
 typedef void(*__ECS_SystemFn)(World*);
 typedef struct {
@@ -272,16 +277,7 @@ typedef enum {
     __ECS_SCHEDULE_ERROR_CYCLE,
 } __ECS_ScheduleResult;
 
-#define __ECS_SECTION __attribute__((section("__ECS_SYSTEM"), used))
-#define __ECS_GET_COMPONENT_SIGNATURE_IMPL(ty, ident) ty* ident
-#define __ECS_GET_COMPONENT_SIGNATURE(ty_ident) __ECS_GET_COMPONENT_SIGNATURE_IMPL ty_ident
-#define __ECS_GET_COMPONENT_ID_IMPL(ty, ident) __ECS_GENERATE_COMPONENT_ID(ty)
-#define __ECS_GET_COMPONENT_ID(ty_ident) __ECS_GET_COMPONENT_ID_IMPL ty_ident 
-#define __ECS_GET_COMPONENT_TYPE(ty, ident) (ty*)
-#define __ECS_GET_COMPONENT_STORAGE(ty, ident) &world->components[__ECS_COMPONENT_ID(ty)]
-#define __ECS_GET_COMPONENT_REF(ty_ident)                                              \
-    __ECS_GET_COMPONENT_TYPE ty_ident                                                  \
-    __ecs_component_storage_get( __ECS_GET_COMPONENT_STORAGE ty_ident, entity)
+#define __ECS_SECTION __attribute__((section("__ECS_SYSTEM"), used, aligned(sizeof(void *))))
 #define __ECS_ARRAY_COUNT(x) ((sizeof(x)) / sizeof(x[0]))
 #define __ECS_STRINGIFY_ARG(x) #x
 #define __ECS_CREATE_DEP_NAMES(...) (const char *[]){                                  \
@@ -302,42 +298,66 @@ typedef enum {
         .count = __ECS_CREATE_DEP_COUNT(__VA_ARGS__)                                   \
     })
 
-#define ECS_SYSTEM_DEPENDS(name, before, after, ...)                                                                      \
-    static void name##_impl(World* world, Entity this, __ECS_FOR_EACH_COMMA(__ECS_GET_COMPONENT_SIGNATURE, __VA_ARGS__)); \
-    static const __ECS_ComponentID name##_query[] = {                                                                     \
-        __ECS_FOR_EACH(__ECS_GET_COMPONENT_ID, __VA_ARGS__)                                                               \
-    };                                                                                                                    \
-    static void name(World* world)                                                                                        \
-    {                                                                                                                     \
-        size_t query_count = sizeof(name##_query) / sizeof(name##_query[0]);                                              \
-        __ECS_ComponentStorage *driver = &world->components[name##_query[0]];                                             \
-        for (uint32_t i = 1; i < query_count; i++) {                                                                      \
-            __ECS_ComponentStorage *candidate = &world->components[name##_query[i]];                                      \
-            if (candidate->count < driver->count) {                                                                       \
-                driver = candidate;                                                                                       \
-            }                                                                                                             \
-        }                                                                                                                 \
-        for (uint32_t i = 0; i < driver->count; i++) {                                                                    \
-            Entity entity = driver->entities[i];                                                                          \
-            if (!__ecs_entity_matches_query(&world->components[0], entity, name##_query, query_count)) {                  \
-                continue;                                                                                                 \
-            }                                                                                                             \
-            name##_impl(                                                                                                  \
-                world,                                                                                                    \
-                entity,                                                                                                   \
-                __ECS_FOR_EACH_COMMA(__ECS_GET_COMPONENT_REF, __VA_ARGS__)                                                \
-            );                                                                                                            \
-        }                                                                                                                 \
-    }                                                                                                                     \
-    static const __ECS_SystemDescription name##_desc __ECS_SECTION = {                                                    \
-        .system_name = #name,                                                                                             \
-        .system_fn = name,                                                                                                \
-        .system_query = name##_query,                                                                                     \
-        .query_len = sizeof(name##_query) / sizeof(name##_query[0]),                                                      \
-        .deps_before = before,                                                                                            \
-        .deps_after = after,                                                                                              \
-    };                                                                                                                    \
-    static void name##_impl(World* world, Entity this, __ECS_FOR_EACH_COMMA(__ECS_GET_COMPONENT_SIGNATURE, __VA_ARGS__))
+#define COMP(ty, ident) (COMP, ty, ident)
+#define RES(ty, ident)  (RES, ty, ident)
+
+#define __ECS_QUERY_ITEM_SIGNATURE(query, ty, ident) __ECS_QUERY_ITEM_SIGNATURE_##query(ty, ident)
+#define __ECS_QUERY_ITEM_SIGNATURE_COMP(ty, ident) ty* ident,
+#define __ECS_QUERY_ITEM_SIGNATURE_RES(ty, ident) ty* ident,
+
+#define __ECS_ADD_QUERY_ITEM_TO_SIGNATURE(query_item) __ECS_QUERY_ITEM_SIGNATURE query_item 
+#define __ECS_SYSTEM_IMPL_SIGNATURE(name, ...)          \
+    static void name##_impl(__ECS_FOR_EACH(__ECS_ADD_QUERY_ITEM_TO_SIGNATURE, __VA_ARGS__) Entity this)
+
+#define __ECS_GET_QUERY_ID_IMPL(query, ty, ident) __ECS_GET_QUERY_ID_##query (ty)
+#define __ECS_GET_QUERY_ID_COMP(ty) __ECS_COMPONENT_ID(ty),
+#define __ECS_GET_QUERY_ID_RES(ty)
+#define __ECS_GET_QUERY_ID(ty_ident) __ECS_GET_QUERY_ID_IMPL ty_ident 
+#define __ECS_GENERATE_QUERY_LIST(name, ...)            \
+    static const __ECS_ComponentID name##_query[] = {   \
+        __ECS_FOR_EACH(__ECS_GET_QUERY_ID, __VA_ARGS__) \
+    }
+
+#define __ECS_GET_QUERY_TYPE(query, ty, ident) (ty*)
+#define __ECS_GET_QUERY_STORAGE(query, ty, ident) __ECS_GET_QUERY_STORAGE_##query(ty)
+#define __ECS_GET_QUERY_STORAGE_COMP(ty) (ty*)__ecs_component_storage_get(&world->components[__ECS_COMPONENT_ID(ty)], entity),
+#define __ECS_GET_QUERY_STORAGE_RES(ty) &world->resource_##ty,
+#define __ECS_GET_QUERY_REF(query)                      \
+    __ECS_GET_QUERY_STORAGE query
+
+#define ECS_SYSTEM_DEPENDS(name, before, after, ...)                                                     \
+    __ECS_SYSTEM_IMPL_SIGNATURE(name, __VA_ARGS__);                                                      \
+    __ECS_GENERATE_QUERY_LIST(name, __VA_ARGS__);                                                        \
+    static void name(World* world)                                                                       \
+    {                                                                                                    \
+        size_t query_count = sizeof(name##_query) / sizeof(name##_query[0]);                             \
+        __ECS_ComponentStorage *driver = &world->components[name##_query[0]];                            \
+        for (uint32_t i = 1; i < query_count; i++) {                                                     \
+            __ECS_ComponentStorage *candidate = &world->components[name##_query[i]];                     \
+            if (candidate->count < driver->count) {                                                      \
+                driver = candidate;                                                                      \
+            }                                                                                            \
+        }                                                                                                \
+        for (uint32_t i = 0; i < driver->count; i++) {                                                   \
+            Entity entity = driver->entities[i];                                                         \
+            if (!__ecs_entity_matches_query(&world->components[0], entity, name##_query, query_count)) { \
+                continue;                                                                                \
+            }                                                                                            \
+            name##_impl(                                                                                 \
+                __ECS_FOR_EACH(__ECS_GET_QUERY_REF, __VA_ARGS__)                                   \
+                entity                                                                                  \
+            );                                                                                           \
+        }                                                                                                \
+    }                                                                                                    \
+    static const __ECS_SystemDescription name##_desc __ECS_SECTION = {                                   \
+        .system_name = #name,                                                                            \
+        .system_fn = name,                                                                               \
+        .system_query = name##_query, \
+        .query_len = __ECS_ARRAY_COUNT(name##_query), \
+        .deps_before = before,                                                                           \
+        .deps_after = after,                                                                             \
+    };                                                                                                   \
+    __ECS_SYSTEM_IMPL_SIGNATURE(name, __VA_ARGS__)
 
 #define ECS_SYSTEM(name, ...) ECS_SYSTEM_DEPENDS(name, ECS_BEFORE(), ECS_AFTER() __VA_OPT__(,) __VA_ARGS__) 
 
@@ -355,20 +375,20 @@ static __ECS_ScheduleResult __ecs_build_schedule(
 
 // ############################ SYSTEM ###############################
 
-// ############################ WORLD ###############################
-void __ecs_world_destory_entity_immediate(World* world, Entity e);
-// ############################ WORLD ###############################
-
 
 #endif
 
-#ifdef ECS_IMPL_COMPONENTS
+#if defined(ECS_IMPL_COMPONENTS) && defined (ECS_IMPL_RESOURCES) 
+#define __ECS_FOR_EACH_RESOURCE(DO) \
+    DO(WorldResource) \
+    ECS_IMPL_RESOURCES(DO) 
+
 
 // ############################ WORLD ###############################
-#define __ECS_COMPONENT_ID(ty) COMPONENT_ID_##ty
 #define __ECS_GENERATE_COMPONENT_ID(ty) __ECS_COMPONENT_ID(ty),
 enum __ECS_ComponentID_e {
     ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID)
+    __ECS_FOR_EACH_RESOURCE(__ECS_GENERATE_COMPONENT_ID)
     __ECS_COMPONENT_ID_COUNT,
 };
 
@@ -377,45 +397,52 @@ const char* __ecs_component_id_names[] = {
     ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID_STRINGS)                                  
 };
 
+typedef struct {
+    World* world;
+} WorldResource;
+
+
+#define __ECS_ADD_RESROUCE_TO_WORLD(ty) ty resource_##ty;
+
 struct World_s {                                                                             
     __ECS_ComponentStorage components[__ECS_COMPONENT_ID_COUNT];                             
     __ECS_CommandBuffer cmd_buffer;                                                          
     Entity next_entity;                                                                      
     __ECS_Schedule schedule;
+    __ECS_FOR_EACH_RESOURCE(__ECS_ADD_RESROUCE_TO_WORLD)
 };
 
 void world_run(World* world)
 {
-    for (int i = 0; i < world->schedule.count; i++)
+    for (uint32_t i = 0; i < world->schedule.count; i++)
     {
         __ecs_command_buffer_drain(world, &world->cmd_buffer);
         __ECS_ScheduleBatch* batch = &world->schedule.batches[i];
         // TODO: run each batch in parallel.
-        for (int j = 0; j < batch->count; j++)
+        for (uint32_t j = 0; j < batch->count; j++)
         {
             batch->systems[j]->system_fn(world);
         }
     }
 }
 
-World world_init(void)
+void world_init(World* world)
 {                                                                       
-    World world = {0};    
+
 #define __ECS_INIT_COMPONENT_STORAGE(ty) \
-    __ecs_component_storage_init(&world.components[__ECS_COMPONENT_ID(ty)], sizeof(ty));                                    
+    __ecs_component_storage_init(&world->components[__ECS_COMPONENT_ID(ty)], sizeof(ty));                                    
     ECS_IMPL_COMPONENTS(__ECS_INIT_COMPONENT_STORAGE)
     extern const __ECS_SystemDescription __start___ECS_SYSTEM[];
     extern const __ECS_SystemDescription __stop___ECS_SYSTEM[];
 
-
-    __ECS_ScheduleResult result = __ecs_build_schedule(__start___ECS_SYSTEM, __stop___ECS_SYSTEM - __start___ECS_SYSTEM, &world.schedule);
+    __ECS_ScheduleResult result = __ecs_build_schedule(__start___ECS_SYSTEM, (__stop___ECS_SYSTEM - __start___ECS_SYSTEM), &world->schedule);
     if (result != __ECS_SCHEDULE_OK)
     {
         printf("Scheduling Error: %d\n", result);
     }
     assert(result == __ECS_SCHEDULE_OK);
 
-    return world;
+    world->resource_WorldResource.world = world;
 }
 
 Entity world_create_entity(World* world)
@@ -740,7 +767,7 @@ void __ecs_command_buffer_push_byte(__ECS_CommandBuffer* cb, uint8_t x)
 void __ecs_command_buffer_push(__ECS_CommandBuffer* cb, void* data, size_t len)
 {
     uint8_t* xs = data;
-    for (int i = 0; i < len; i++)
+    for (size_t i = 0; i < len; i++)
     {
         __ecs_command_buffer_push_byte(cb, xs[i]);
     }
@@ -806,6 +833,8 @@ static __ECS_ScheduleResult __ecs_build_schedule(
         return __ECS_SCHEDULE_OK;
     }
 
+    printf("System Count: %u\n", system_count);
+
     uint8_t *edges = calloc(system_count * system_count, sizeof(uint8_t));
     uint32_t *in_degree = calloc(system_count, sizeof(uint32_t));
     uint8_t *scheduled = calloc(system_count, sizeof(uint8_t));
@@ -818,6 +847,7 @@ static __ECS_ScheduleResult __ecs_build_schedule(
         free(in_degree);
         free(scheduled);
         free(batches);
+        printf("OOM 1\n");
         return __ECS_SCHEDULE_ERROR_OUT_OF_MEMORY;
     }
     
@@ -932,6 +962,8 @@ static __ECS_ScheduleResult __ecs_build_schedule(
             }
 
             free(batches);
+            printf("OOM 2\n");
+
             return __ECS_SCHEDULE_ERROR_OUT_OF_MEMORY;
         }
 
@@ -991,30 +1023,30 @@ static __ECS_ScheduleResult __ecs_build_schedule(
     out_schedule->batches = batches;
     out_schedule->count = batch_count;
 
-    for (int i = 0; i < out_schedule->count; i++)
+    for (uint32_t i = 0; i < out_schedule->count; i++)
     {
         __ECS_ScheduleBatch* batch = &out_schedule->batches[i];
         
-        for (int sys_idx0 = 0; sys_idx0 < batch->count - 1; sys_idx0++)
+        for (uint32_t sys_idx0 = 0; sys_idx0 < batch->count - 1; sys_idx0++)
         {
             const __ECS_SystemDescription* sys = __ecs_schedule_batch_get_system(batch, sys_idx0);
-            const __ECS_ComponentID* sys_query = __ecs_system_get_query(sys);
-            const size_t sys_query_len = __ecs_system_get_query_len(sys);
-            for (int sys_idx1 = sys_idx0 + 1; sys_idx1 < batch->count; sys_idx1++)
+            const __ECS_ComponentID* sys_dependencies = __ecs_system_get_query(sys);
+            const size_t sys_dependencies_len = __ecs_system_get_query_len(sys);
+            for (uint32_t sys_idx1 = sys_idx0 + 1; sys_idx1 < batch->count; sys_idx1++)
             {
                 const __ECS_SystemDescription* sys2 = __ecs_schedule_batch_get_system(batch, sys_idx1);
                 const __ECS_ComponentID* sys2_query = __ecs_system_get_query(sys2);
                 const size_t sys2_query_len = __ecs_system_get_query_len(sys2);
 
-                for (int q1 = 0; q1 < sys_query_len; q1++)
+                for (uint32_t q1 = 0; q1 < sys_dependencies_len; q1++)
                 {
-                    for (int q2 = 0; q2 < sys2_query_len; q2++)
+                    for (uint32_t q2 = 0; q2 < sys2_query_len; q2++)
                     {
 
-                        if (sys_query[q1] == sys2_query[q2])
+                        if (sys_dependencies[q1] == sys2_query[q2])
                         {
                             printf("Unspecified dependency between systems `%s` and `%s`.\n", sys->system_name, sys2->system_name);
-                            printf("Both utilize component `%s`.\n", __ecs_component_id_names[sys_query[q1]]);
+                            printf("Both utilize component `%s`.\n", __ecs_component_id_names[sys_dependencies[q1]]);
                             assert(0);
                         }
                     }
