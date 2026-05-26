@@ -257,7 +257,7 @@ void __ecs_world_destory_entity_immediate(World* world, Entity e);
 // ############################ WORLD ###############################
 
 // ############################ SYSTEM ###############################
-typedef void(*__ECS_SystemFn)(const World*, __ECS_CommandBuffer*);
+typedef void(*__ECS_SystemFn)(World*, __ECS_CommandBuffer*);
 
 typedef struct {
     const __ECS_SystemFn system_fn;
@@ -278,6 +278,8 @@ typedef struct {
     const __ECS_SystemFn system_fn;
     const __ECS_ComponentID* system_query;
     const size_t query_len;
+    const __ECS_ComponentID* system_dependencies;
+    const size_t dependencies_len;
     const __ECS_SystemDependencyListBefore deps_before;
     const __ECS_SystemDependencyListAfter deps_after;
     pthread_t* const thread;
@@ -346,6 +348,17 @@ typedef enum {
         __ECS_FOR_EACH(__ECS_GET_QUERY_ID, __VA_ARGS__) \
     }
 
+#define __ECS_GET_DEPENDENCY_ID_IMPL(query, ty, ident) __ECS_GET_DEPENDENCY_ID_##query (ty)
+#define __ECS_GET_DEPENDENCY_ID_COMP(ty) __ECS_COMPONENT_ID(ty),
+#define __ECS_GET_DEPENDENCY_ID_RES(ty)  __ECS_COMPONENT_ID(ty),
+#define __ECS_GET_DEPENDENCY_ID_CMDS(ty) 
+#define __ECS_GET_DEPENDENCY_ID(ty_ident) __ECS_GET_DEPENDENCY_ID_IMPL ty_ident 
+#define __ECS_GENERATE_DEPENDENCY_LIST(name, ...)       \
+    static const __ECS_ComponentID name##_dependencies[] = {   \
+        __ECS_FOR_EACH(__ECS_GET_DEPENDENCY_ID, __VA_ARGS__) \
+    }
+
+
 #define __ECS_GET_QUERY_TYPE(query, ty, ident) (ty*)
 #define __ECS_GET_QUERY_STORAGE(query, ty, ident) __ECS_GET_QUERY_STORAGE_##query(ty)
 #define __ECS_GET_QUERY_STORAGE_COMP(ty) (ty*)__ecs_component_storage_get(&world->components[__ECS_COMPONENT_ID(ty)], entity),
@@ -357,9 +370,14 @@ typedef enum {
 #define ECS_SYSTEM_DEPENDS(name, before, after, ...)                                                     \
     __ECS_SYSTEM_IMPL_SIGNATURE(name, __VA_ARGS__);                                                      \
     __ECS_GENERATE_QUERY_LIST(name, __VA_ARGS__);                                                        \
-    static void name(const World* world, __ECS_CommandBuffer* command_buffer)                                  \
+    __ECS_GENERATE_DEPENDENCY_LIST(name, __VA_ARGS__); \
+    static void name(World* world, __ECS_CommandBuffer* command_buffer)                                  \
     {                                                                                                    \
         size_t query_count = sizeof(name##_query) / sizeof(name##_query[0]);                             \
+        if (query_count == 0)\
+        {\
+            return;\
+        }\
         const __ECS_ComponentStorage *driver = &world->components[name##_query[0]];                            \
         for (uint32_t i = 1; i < query_count; i++) {                                                     \
             const __ECS_ComponentStorage *candidate = &world->components[name##_query[i]];                     \
@@ -386,6 +404,8 @@ typedef enum {
         .system_fn = name,                                                                               \
         .system_query = name##_query, \
         .query_len = __ECS_ARRAY_COUNT(name##_query), \
+        .system_dependencies = name##_dependencies, \
+        .dependencies_len = __ECS_ARRAY_COUNT(name##_dependencies), \
         .deps_before = before,                                                                           \
         .deps_after = after,                                                                             \
         .thread = &name##_thread, \
@@ -408,6 +428,7 @@ static __ECS_ScheduleResult __ecs_build_schedule(
 );
 void __ecs_schedule_free(__ECS_Schedule* schedule);
 static void __ecs_schedule_batch_run(const __ECS_ScheduleBatch* self, World* world);
+static void __ecs_schedule_batch_print(const __ECS_ScheduleBatch* self);
 // ############################ SYSTEM ###############################
 
 
@@ -424,7 +445,8 @@ enum __ECS_ComponentID_e {
 
 #define __ECS_GENERATE_COMPONENT_ID_STRINGS(ty) "COMPONENT_ID_" #ty,
 const char* __ecs_component_id_names[] = {                                                   
-    ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID_STRINGS)                                  
+    ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID_STRINGS)      
+    ECS_IMPL_RESOURCES(__ECS_GENERATE_COMPONENT_ID_STRINGS)
 };
 
 #define __ECS_ADD_RESROUCE_TO_WORLD(ty) ty resource_##ty;
@@ -462,6 +484,12 @@ void world_init(World* world)
         printf("Scheduling Error: %d\n", result);
     }
     assert(result == __ECS_SCHEDULE_OK);
+
+    for (uint32_t i = 0; i < world->schedule.count; i++)
+    {
+        __ecs_schedule_batch_print(&world->schedule.batches[i]);
+    }
+
 }
 
 void world_free(World* world)
@@ -915,7 +943,7 @@ static void* __ecs_system_job(void* arg)
 
 }
 
-static void __ecs_schedule_batch_run(const __ECS_ScheduleBatch* self, World* world)
+static void __ecs_schedule_batch_run_multithreaded(const __ECS_ScheduleBatch* self, World* world)
 {
     for (uint32_t i = 0; i < self->count; i++)
     {   
@@ -939,6 +967,26 @@ static void __ecs_schedule_batch_run(const __ECS_ScheduleBatch* self, World* wor
     }
 }
 
+static void __ecs_schedule_batch_run_singlethreaded(const __ECS_ScheduleBatch* self, World* world)
+{
+    for (uint32_t i = 0; i < self->count; i++)
+    {
+        self->systems[i]->system_fn(world, &self->systems[i]->job->cmd);
+    }
+
+    for (uint32_t i = 0; i < self->count; i++)
+    {
+        __ecs_command_buffer_drain(world, &self->systems[i]->job->cmd);
+    }
+}
+
+static void __ecs_schedule_batch_run(const __ECS_ScheduleBatch* self, World* world)
+{
+    (self->count >= 2 ? 
+        __ecs_schedule_batch_run_multithreaded : 
+        __ecs_schedule_batch_run_singlethreaded)(self,world);
+}
+
 static const __ECS_SystemDescription* __ecs_schedule_batch_get_system(const __ECS_ScheduleBatch* self, size_t idx)
 {
     if (self == NULL) return NULL;
@@ -947,16 +995,26 @@ static const __ECS_SystemDescription* __ecs_schedule_batch_get_system(const __EC
     return self->systems[idx];
 }
 
-static const __ECS_ComponentID* __ecs_system_get_query(const __ECS_SystemDescription* self)
+static void __ecs_schedule_batch_print(const __ECS_ScheduleBatch* self)
 {
-    if (self == NULL) return NULL;
-    return self->system_query;
+    printf("[");
+    for (uint32_t i = 0; i < self->count; i++)
+    {
+        printf(" %s", self->systems[i]->system_name);
+    }
+    printf(" ]\n");
 }
 
-static size_t __ecs_system_get_query_len(const __ECS_SystemDescription* self)
+static const __ECS_ComponentID* __ecs_system_get_dependencies(const __ECS_SystemDescription* self)
+{
+    if (self == NULL) return NULL;
+    return self->system_dependencies;
+}
+
+static size_t __ecs_system_get_dependencies_len(const __ECS_SystemDescription* self)
 {
     if (self == NULL) return 0;
-    return self->query_len;
+    return self->dependencies_len;
 }
 
 static __ECS_ScheduleResult __ecs_build_schedule(
@@ -993,6 +1051,7 @@ static __ECS_ScheduleResult __ecs_build_schedule(
         batches[i].systems = NULL;
         batches[i].count = 0;
     }
+
 #define ECS_ADD_EDGE(from, to)                                      \
     do {                                                           \
         uint32_t __from = (uint32_t)(from);                        \
@@ -1165,20 +1224,19 @@ static __ECS_ScheduleResult __ecs_build_schedule(
         for (uint32_t sys_idx0 = 0; sys_idx0 < batch->count - 1; sys_idx0++)
         {
             const __ECS_SystemDescription* sys = __ecs_schedule_batch_get_system(batch, sys_idx0);
-            const __ECS_ComponentID* sys_dependencies = __ecs_system_get_query(sys);
-            const size_t sys_dependencies_len = __ecs_system_get_query_len(sys);
+            const __ECS_ComponentID* sys_dependencies = __ecs_system_get_dependencies(sys);
+            const size_t sys_dependencies_len = __ecs_system_get_dependencies_len(sys);
             for (uint32_t sys_idx1 = sys_idx0 + 1; sys_idx1 < batch->count; sys_idx1++)
             {
                 const __ECS_SystemDescription* sys2 = __ecs_schedule_batch_get_system(batch, sys_idx1);
-                const __ECS_ComponentID* sys2_query = __ecs_system_get_query(sys2);
-                const size_t sys2_query_len = __ecs_system_get_query_len(sys2);
+                const __ECS_ComponentID* sys2_dependencies = __ecs_system_get_dependencies(sys2);
+                const size_t sys2_dependencies_len = __ecs_system_get_dependencies_len(sys2);
 
                 for (uint32_t q1 = 0; q1 < sys_dependencies_len; q1++)
                 {
-                    for (uint32_t q2 = 0; q2 < sys2_query_len; q2++)
+                    for (uint32_t q2 = 0; q2 < sys2_dependencies_len; q2++)
                     {
-
-                        if (sys_dependencies[q1] == sys2_query[q2])
+                        if (sys_dependencies[q1] == sys2_dependencies[q2])
                         {
                             printf("Unspecified dependency between systems `%s` and `%s`.\n", sys->system_name, sys2->system_name);
                             printf("Both utilize component `%s`.\n", __ecs_component_id_names[sys_dependencies[q1]]);

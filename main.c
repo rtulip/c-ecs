@@ -38,7 +38,7 @@ ECS_SYSTEM(spawner, COMP(Spawner, s), COMMANDS(cmd))
     cmd_entity_add_component(Counter)(cmd, e, (Counter){0});
 }
 
-ECS_SYSTEM(destroyer, COMP(Counter, c), COMMANDS(cmd))
+ECS_SYSTEM_DEPENDS(destroyer, ECS_BEFORE(debug_counter), ECS_AFTER(), COMP(Counter, c), COMMANDS(cmd))
 {
     if (c->count == 5)
     {
@@ -46,7 +46,7 @@ ECS_SYSTEM(destroyer, COMP(Counter, c), COMMANDS(cmd))
     }
 }
 
-ECS_SYSTEM_DEPENDS(counter, ECS_BEFORE(debug_counter), ECS_AFTER(spawner), COMP(Counter, c))
+ECS_SYSTEM_DEPENDS(counter, ECS_BEFORE(debug_counter, destroyer), ECS_AFTER(spawner), COMP(Counter, c))
 {
     (void)(self);
     c->count += 1;
@@ -64,10 +64,26 @@ ECS_SYSTEM(movement, COMP(Position, p), COMP(Velocity, v))
     p->y += v->dy;
 }
 
-ECS_SYSTEM_DEPENDS(print, ECS_BEFORE(), ECS_AFTER(movement), COMP(Position, p))
+ECS_SYSTEM_DEPENDS(print, ECS_BEFORE(), ECS_AFTER(movement, counter), COMP(Position, p))
 {
+    (void)(self);
     printf("Entity[%d]: Position(%d, %d)\n", self, p->x, p->y);
 }
+
+ECS_SYSTEM_DEPENDS(res1, ECS_BEFORE(destroyer), ECS_AFTER(), COMP(Counter, c), RES(Foo, f))
+{
+    (void)(self);
+    (void)c;
+    *f = *f + 1;
+}
+
+ECS_SYSTEM_DEPENDS(res2, ECS_BEFORE(), ECS_AFTER(movement), COMP(Position, p), RES(Foo, f))
+{
+    (void)(self);
+    (void)p;
+    *f = *f + 1;
+}
+
 
 int main(){
 
@@ -103,10 +119,13 @@ int main(){
         
     }
 
-    for (int i = 0; i < 100; i++)
+    for (int i = 0; i < 10; i++)
     {
         world_run(&w);
     }
 
+    printf("Foo: %d\n", w.resource_Foo);
+
     world_free(&w);
+
 }
