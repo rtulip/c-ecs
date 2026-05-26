@@ -6,6 +6,7 @@
 #include <assert.h>
 #include <stdbool.h>
 #include <string.h>
+#include <pthread.h>
 
 // ############################ FOR EACH ############################
 #define __ECS_EXPAND(x) x
@@ -166,7 +167,7 @@ static bool __ecs_component_storage_has(
     Entity entity
 );
 static void *__ecs_component_storage_get(
-    __ECS_ComponentStorage *s,
+    const __ECS_ComponentStorage *s,
     Entity entity
 );
 static void *__ecs_component_storage_add_uninitialized(
@@ -188,10 +189,10 @@ static void __ecs_component_storage_remove(
 // ############################# QUERY ##############################
 
 static bool __ecs_entity_matches_query(
-    __ECS_ComponentStorage* components,
-    Entity entity,
+    const __ECS_ComponentStorage* components,
+    const Entity entity,
     const __ECS_ComponentID *query,
-    uint32_t query_count
+    const uint32_t query_count
 );
 
 // ############################# QUERY ##############################
@@ -245,7 +246,7 @@ void __ecs_command_buffer_remove_component(
     Entity e, 
     __ECS_ComponentID id
 );
-void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb);
+void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb, Entity* resolved, size_t len);
 void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb);
 void __ecs_command_buffer_free(__ECS_CommandBuffer* cb);
 // ########################### COMMANDS #############################
@@ -256,7 +257,13 @@ void __ecs_world_destory_entity_immediate(World* world, Entity e);
 // ############################ WORLD ###############################
 
 // ############################ SYSTEM ###############################
-typedef void(*__ECS_SystemFn)(World*);
+typedef void(*__ECS_SystemFn)(const World*, __ECS_CommandBuffer*);
+
+typedef struct {
+    const __ECS_SystemFn system_fn;
+    __ECS_CommandBuffer cmd;
+    World* world;
+} __ECS_SystemJob;
 typedef struct {
     const char** names;
     const size_t count;
@@ -273,6 +280,8 @@ typedef struct {
     const size_t query_len;
     const __ECS_SystemDependencyListBefore deps_before;
     const __ECS_SystemDependencyListAfter deps_after;
+    pthread_t* const thread;
+    __ECS_SystemJob* const job;
 } __ECS_SystemDescription;
 
 typedef struct {
@@ -324,7 +333,7 @@ typedef enum {
 
 #define __ECS_ADD_QUERY_ITEM_TO_SIGNATURE(query_item) __ECS_QUERY_ITEM_SIGNATURE query_item 
 #define __ECS_SYSTEM_IMPL_SIGNATURE(name, ...)          \
-    static void name##_impl(__ECS_FOR_EACH(__ECS_ADD_QUERY_ITEM_TO_SIGNATURE, __VA_ARGS__) Entity this)
+    static void name##_impl(__ECS_FOR_EACH(__ECS_ADD_QUERY_ITEM_TO_SIGNATURE, __VA_ARGS__) Entity self)
 
 #define __ECS_GET_QUERY_ID_IMPL(query, ty, ident) __ECS_GET_QUERY_ID_##query (ty)
 #define __ECS_GET_QUERY_ID_COMP(ty) __ECS_COMPONENT_ID(ty),
@@ -341,19 +350,19 @@ typedef enum {
 #define __ECS_GET_QUERY_STORAGE(query, ty, ident) __ECS_GET_QUERY_STORAGE_##query(ty)
 #define __ECS_GET_QUERY_STORAGE_COMP(ty) (ty*)__ecs_component_storage_get(&world->components[__ECS_COMPONENT_ID(ty)], entity),
 #define __ECS_GET_QUERY_STORAGE_RES(ty) &world->resource_##ty,
-#define __ECS_GET_QUERY_STORAGE_CMDS(ty) &world->cmd_buffer,
+#define __ECS_GET_QUERY_STORAGE_CMDS(ty) command_buffer,
 #define __ECS_GET_QUERY_REF(query)                      \
     __ECS_GET_QUERY_STORAGE query
 
 #define ECS_SYSTEM_DEPENDS(name, before, after, ...)                                                     \
     __ECS_SYSTEM_IMPL_SIGNATURE(name, __VA_ARGS__);                                                      \
     __ECS_GENERATE_QUERY_LIST(name, __VA_ARGS__);                                                        \
-    static void name(World* world)                                                                       \
+    static void name(const World* world, __ECS_CommandBuffer* command_buffer)                                  \
     {                                                                                                    \
         size_t query_count = sizeof(name##_query) / sizeof(name##_query[0]);                             \
-        __ECS_ComponentStorage *driver = &world->components[name##_query[0]];                            \
+        const __ECS_ComponentStorage *driver = &world->components[name##_query[0]];                            \
         for (uint32_t i = 1; i < query_count; i++) {                                                     \
-            __ECS_ComponentStorage *candidate = &world->components[name##_query[i]];                     \
+            const __ECS_ComponentStorage *candidate = &world->components[name##_query[i]];                     \
             if (candidate->count < driver->count) {                                                      \
                 driver = candidate;                                                                      \
             }                                                                                            \
@@ -368,7 +377,10 @@ typedef enum {
                 entity                                                                                  \
             );                                                                                           \
         }                                                                                                \
+        (void)(command_buffer); \
     }                                                                                                    \
+    static pthread_t name##_thread; \
+    static __ECS_SystemJob name##_job = { .system_fn = name, }; \
     static const __ECS_SystemDescription name##_desc __ECS_SECTION = {                                   \
         .system_name = #name,                                                                            \
         .system_fn = name,                                                                               \
@@ -376,6 +388,8 @@ typedef enum {
         .query_len = __ECS_ARRAY_COUNT(name##_query), \
         .deps_before = before,                                                                           \
         .deps_after = after,                                                                             \
+        .thread = &name##_thread, \
+        .job = &name##_job, \
     };                                                                                                   \
     __ECS_SYSTEM_IMPL_SIGNATURE(name, __VA_ARGS__)
 
@@ -393,7 +407,7 @@ static __ECS_ScheduleResult __ecs_build_schedule(
     __ECS_Schedule *out_schedule
 );
 void __ecs_schedule_free(__ECS_Schedule* schedule);
-
+static void __ecs_schedule_batch_run(const __ECS_ScheduleBatch* self, World* world);
 // ############################ SYSTEM ###############################
 
 
@@ -417,7 +431,7 @@ const char* __ecs_component_id_names[] = {
 
 struct World_s {                                                                             
     __ECS_ComponentStorage components[__ECS_COMPONENT_ID_COUNT];                             
-    __ECS_CommandBuffer cmd_buffer;                                                          
+    __ECS_CommandBuffer cmd_buffer;
     Entity next_entity;                                                                      
     __ECS_Schedule schedule;
     ECS_IMPL_RESOURCES(__ECS_ADD_RESROUCE_TO_WORLD)
@@ -425,15 +439,11 @@ struct World_s {
 
 void world_run(World* world)
 {
+    __ecs_command_buffer_drain(world, &world->cmd_buffer);
     for (uint32_t i = 0; i < world->schedule.count; i++)
     {
-        __ecs_command_buffer_drain(world, &world->cmd_buffer);
         __ECS_ScheduleBatch* batch = &world->schedule.batches[i];
-        // TODO: run each batch in parallel.
-        for (uint32_t j = 0; j < batch->count; j++)
-        {
-            batch->systems[j]->system_fn(world);
-        }
+        __ecs_schedule_batch_run(batch, world);
     }
 }
 
@@ -464,6 +474,15 @@ void world_free(World* world)
     __ecs_command_buffer_free(&world->cmd_buffer);
     __ecs_schedule_free(&world->schedule);
     
+    extern const __ECS_SystemDescription __start___ECS_SYSTEM[];
+    extern const __ECS_SystemDescription __stop___ECS_SYSTEM[];
+
+    for (int i = 0; i < (__stop___ECS_SYSTEM - __start___ECS_SYSTEM); i++)
+    {
+        const __ECS_SystemDescription* sys = &__start___ECS_SYSTEM[i];
+        __ecs_command_buffer_free(&sys->job->cmd);
+    }
+
 }
 
 static Entity world_create_entity(World* world)
@@ -510,6 +529,9 @@ static void __ecs_component_storage_reserve_dense(
     __ECS_ComponentStorage *s,
     uint32_t new_capacity
 ) {
+    
+    
+
     if (new_capacity <= s->capacity) {
         return;
     }
@@ -518,14 +540,17 @@ static void __ecs_component_storage_reserve_dense(
         s->entities,
         sizeof(Entity) * new_capacity
     );
-
-    void *new_components = realloc(
-        s->components,
-        s->component_size * new_capacity
-    );
-
     assert(new_entities != NULL);
-    assert(new_components != NULL);
+
+    void* new_components = NULL;
+    if (s->component_size != 0)
+    {
+        new_components = realloc(
+            s->components,
+            s->component_size * new_capacity
+        );
+        assert(new_components != NULL);
+    }
 
     s->entities = new_entities;
     s->components = new_components;
@@ -584,7 +609,7 @@ static bool __ecs_component_storage_has(
 }
 
 static void *__ecs_component_storage_get(
-    __ECS_ComponentStorage *s,
+    const __ECS_ComponentStorage *s,
     Entity entity
 ) {
     if (!__ecs_component_storage_has(s, entity)) {
@@ -661,10 +686,10 @@ static void __ecs_component_storage_remove(
 
 // ############################# QUERY ##############################
 static bool __ecs_entity_matches_query(                                                      
-    __ECS_ComponentStorage* components,                                                      
-    Entity entity,                                                                           
+    const __ECS_ComponentStorage* components,                                                      
+    const Entity entity,                                                                           
     const __ECS_ComponentID *query,                                                          
-    uint32_t query_count                                                                     
+    const uint32_t query_count                                                                     
 ) {                                                                                          
     for (uint32_t i = 0; i < query_count; i++) {                                             
         if (!__ecs_component_storage_has(                                                    
@@ -710,13 +735,15 @@ void __ecs_command_buffer_add_component(
     __ecs_command_buffer_push(cb, component_data, component_size);                           
 }
 
-void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb)          
+void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb, Entity* resolved, size_t len)          
 {
 
     Entity e = cmd.entity;
     if (__ecs_entity_is_deferred(e))
     {
         e = __ecs_entity_deferred_index(e);
+        assert(e < len);
+        e = resolved[e];
     }
 
     switch (cmd.kind)                                                                        
@@ -769,15 +796,15 @@ void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb)
 
     Entity* resolved = __ecs_command_buffer_prepare_deferred_entities(cb, world);
     assert(resolved != NULL);
-
     while (cb->start < cb->size)
     {
         __ECS_Command* cmd = __ecs_command_buffer_pop(cb, sizeof(__ECS_Command));
-        __ecs_command_handle(world, *cmd, cb);                                               
+        __ecs_command_handle(world, *cmd, cb, resolved, cb->next_entity);
     }
 
     free(resolved);
-}                                                                                            
+    cb->next_entity = 0;
+}
 
 void __ecs_command_buffer_remove_component(                                                  
     __ECS_CommandBuffer* cb,                                                                 
@@ -815,7 +842,7 @@ static void cmd_destroy_entity(__ECS_CommandBuffer* cmd, Entity e)
 }
 
 static Entity cmd_create_entity(__ECS_CommandBuffer* cmd)
-{   
+{
     return __ecs_make_deferred_entity(cmd->next_entity++);
 }
 
@@ -876,6 +903,40 @@ static int __ecs_find_system_index(
     }
 
     return -1;
+}
+
+static void* __ecs_system_job(void* arg)
+{
+
+    __ECS_SystemJob* job = arg;
+    job->system_fn(job->world, &job->cmd);
+
+    return NULL;
+
+}
+
+static void __ecs_schedule_batch_run(const __ECS_ScheduleBatch* self, World* world)
+{
+    for (uint32_t i = 0; i < self->count; i++)
+    {   
+        self->systems[i]->job->world = world;
+        
+        int rc = pthread_create(
+            self->systems[i]->thread,
+            NULL,
+            __ecs_system_job,
+            self->systems[i]->job
+        );
+        assert(rc == 0);
+    }
+    
+    for (uint32_t i = 0; i < self->count; i++) {
+        pthread_join(*self->systems[i]->thread, NULL);
+    }
+
+    for (uint32_t i = 0; i < self->count; i++) {
+        __ecs_command_buffer_drain(world, &self->systems[i]->job->cmd);
+    }
 }
 
 static const __ECS_SystemDescription* __ecs_schedule_batch_get_system(const __ECS_ScheduleBatch* self, size_t idx)
