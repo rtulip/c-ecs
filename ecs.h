@@ -150,6 +150,9 @@ static void __ecs_component_storage_init(
     __ECS_ComponentStorage *s,
     size_t component_size
 );
+static void __ecs_component_storage_free(
+    __ECS_ComponentStorage *s
+);
 static void __ecs_component_storage_reserve_dense(
     __ECS_ComponentStorage *s,
     uint32_t new_capacity
@@ -211,12 +214,24 @@ typedef struct {
     size_t size;
     size_t capacity;
     size_t start;
+
+    Entity next_entity;
 } __ECS_CommandBuffer;
 
-#define entity_add_component(ty) entity_add_component_##ty
-#define entity_remove_component(ty) entity_remove_component_##ty
+#define __ECS_ENTITY_DEFERRED_BIT (0x80000000u)
+
+static Entity __ecs_make_deferred_entity(uint32_t local_index);
+static int __ecs_entity_is_deferred(Entity e);
+static uint32_t __ecs_entity_deferred_index(Entity e);
+
+#define cmd_entity_add_component(ty) cmd_entity_add_component_##ty
+#define cmd_entity_remove_component(ty) cmd_entity_remove_component_##ty
+
+static Entity cmd_create_entity(__ECS_CommandBuffer* cmd);
+static void   cmd_destroy_entity(__ECS_CommandBuffer* cmd, Entity e);
 void* __ecs_command_buffer_pop(__ECS_CommandBuffer* cb, size_t size);
 void __ecs_command_buffer_push(__ECS_CommandBuffer* cb, void* data, size_t len);
+void __ecs_command_buffer_create_entity(__ECS_CommandBuffer* cb, Entity e);
 void __ecs_command_buffer_destroy_entity(__ECS_CommandBuffer* cb, Entity e);
 void __ecs_command_buffer_add_component(
     __ECS_CommandBuffer* cb, 
@@ -232,7 +247,7 @@ void __ecs_command_buffer_remove_component(
 );
 void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb);
 void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb);
-
+void __ecs_command_buffer_free(__ECS_CommandBuffer* cb);
 // ########################### COMMANDS #############################
 
 // ############################ WORLD ###############################
@@ -300,10 +315,12 @@ typedef enum {
 
 #define COMP(ty, ident) (COMP, ty, ident)
 #define RES(ty, ident)  (RES, ty, ident)
+#define COMMANDS(ident) (CMDS, __ECS_CommandBuffer, ident)
 
 #define __ECS_QUERY_ITEM_SIGNATURE(query, ty, ident) __ECS_QUERY_ITEM_SIGNATURE_##query(ty, ident)
 #define __ECS_QUERY_ITEM_SIGNATURE_COMP(ty, ident) ty* ident,
 #define __ECS_QUERY_ITEM_SIGNATURE_RES(ty, ident) ty* ident,
+#define __ECS_QUERY_ITEM_SIGNATURE_CMDS(ty, ident) ty* ident,
 
 #define __ECS_ADD_QUERY_ITEM_TO_SIGNATURE(query_item) __ECS_QUERY_ITEM_SIGNATURE query_item 
 #define __ECS_SYSTEM_IMPL_SIGNATURE(name, ...)          \
@@ -312,6 +329,8 @@ typedef enum {
 #define __ECS_GET_QUERY_ID_IMPL(query, ty, ident) __ECS_GET_QUERY_ID_##query (ty)
 #define __ECS_GET_QUERY_ID_COMP(ty) __ECS_COMPONENT_ID(ty),
 #define __ECS_GET_QUERY_ID_RES(ty)
+#define __ECS_GET_QUERY_ID_CMDS(ty) 
+
 #define __ECS_GET_QUERY_ID(ty_ident) __ECS_GET_QUERY_ID_IMPL ty_ident 
 #define __ECS_GENERATE_QUERY_LIST(name, ...)            \
     static const __ECS_ComponentID name##_query[] = {   \
@@ -322,6 +341,7 @@ typedef enum {
 #define __ECS_GET_QUERY_STORAGE(query, ty, ident) __ECS_GET_QUERY_STORAGE_##query(ty)
 #define __ECS_GET_QUERY_STORAGE_COMP(ty) (ty*)__ecs_component_storage_get(&world->components[__ECS_COMPONENT_ID(ty)], entity),
 #define __ECS_GET_QUERY_STORAGE_RES(ty) &world->resource_##ty,
+#define __ECS_GET_QUERY_STORAGE_CMDS(ty) &world->cmd_buffer,
 #define __ECS_GET_QUERY_REF(query)                      \
     __ECS_GET_QUERY_STORAGE query
 
@@ -372,6 +392,7 @@ static __ECS_ScheduleResult __ecs_build_schedule(
     uint32_t system_count,
     __ECS_Schedule *out_schedule
 );
+void __ecs_schedule_free(__ECS_Schedule* schedule);
 
 // ############################ SYSTEM ###############################
 
@@ -379,16 +400,11 @@ static __ECS_ScheduleResult __ecs_build_schedule(
 #endif
 
 #if defined(ECS_IMPL_COMPONENTS) && defined (ECS_IMPL_RESOURCES) 
-#define __ECS_FOR_EACH_RESOURCE(DO) \
-    DO(WorldResource) \
-    ECS_IMPL_RESOURCES(DO) 
-
-
 // ############################ WORLD ###############################
 #define __ECS_GENERATE_COMPONENT_ID(ty) __ECS_COMPONENT_ID(ty),
 enum __ECS_ComponentID_e {
     ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID)
-    __ECS_FOR_EACH_RESOURCE(__ECS_GENERATE_COMPONENT_ID)
+    ECS_IMPL_RESOURCES(__ECS_GENERATE_COMPONENT_ID)
     __ECS_COMPONENT_ID_COUNT,
 };
 
@@ -397,11 +413,6 @@ const char* __ecs_component_id_names[] = {
     ECS_IMPL_COMPONENTS(__ECS_GENERATE_COMPONENT_ID_STRINGS)                                  
 };
 
-typedef struct {
-    World* world;
-} WorldResource;
-
-
 #define __ECS_ADD_RESROUCE_TO_WORLD(ty) ty resource_##ty;
 
 struct World_s {                                                                             
@@ -409,7 +420,7 @@ struct World_s {
     __ECS_CommandBuffer cmd_buffer;                                                          
     Entity next_entity;                                                                      
     __ECS_Schedule schedule;
-    __ECS_FOR_EACH_RESOURCE(__ECS_ADD_RESROUCE_TO_WORLD)
+    ECS_IMPL_RESOURCES(__ECS_ADD_RESROUCE_TO_WORLD)
 };
 
 void world_run(World* world)
@@ -441,11 +452,21 @@ void world_init(World* world)
         printf("Scheduling Error: %d\n", result);
     }
     assert(result == __ECS_SCHEDULE_OK);
-
-    world->resource_WorldResource.world = world;
 }
 
-Entity world_create_entity(World* world)
+void world_free(World* world)
+{
+    for (int i = 0; i < __ECS_COMPONENT_ID_COUNT; i++)
+    {
+        __ecs_component_storage_free(&world->components[i]);
+    }
+
+    __ecs_command_buffer_free(&world->cmd_buffer);
+    __ecs_schedule_free(&world->schedule);
+    
+}
+
+static Entity world_create_entity(World* world)
 {
     return world->next_entity++;
 }
@@ -476,6 +497,13 @@ static void __ecs_component_storage_init(
     s->sparse_capacity = 0;
 
     s->component_size = component_size;
+}
+
+static void __ecs_component_storage_free(__ECS_ComponentStorage* s)
+{
+    free(s->components);
+    free(s->entities);
+    free(s->sparse);
 }
 
 static void __ecs_component_storage_reserve_dense(
@@ -653,13 +681,13 @@ static bool __ecs_entity_matches_query(
 
 // ########################### COMMANDS #############################
 #define __ECS_GENERATE_MODIFY_COMPONENT_FNS(ty)                                                                    \
-    void entity_add_component(ty)(World* world, Entity e, ty value)                                            \
+    void cmd_entity_add_component(ty)(__ECS_CommandBuffer* cmd, Entity e, ty value)                                            \
     {                                                                                                          \
-        __ecs_command_buffer_add_component(&world->cmd_buffer, e, __ECS_COMPONENT_ID(ty), &value, sizeof(ty)); \
+        __ecs_command_buffer_add_component(cmd, e, __ECS_COMPONENT_ID(ty), &value, sizeof(ty)); \
     }                                                                                                          \
-    void entity_remove_component(ty)(World* world, Entity e)                                                   \
+    void cmd_entity_remove_component(ty)(__ECS_CommandBuffer* cmd, Entity e)                                                   \
     {                                                                                                          \
-        __ecs_command_buffer_remove_component(&world->cmd_buffer, e, __ECS_COMPONENT_ID(ty));                  \
+        __ecs_command_buffer_remove_component(cmd, e, __ECS_COMPONENT_ID(ty));                  \
     }
 
 ECS_IMPL_COMPONENTS(__ECS_GENERATE_MODIFY_COMPONENT_FNS)
@@ -680,14 +708,22 @@ void __ecs_command_buffer_add_component(
     __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));                                        
     __ecs_command_buffer_push(cb, &id, sizeof(id));                                          
     __ecs_command_buffer_push(cb, component_data, component_size);                           
-}                                                                                            
+}
+
 void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* cb)          
-{                                                                                            
+{
+
+    Entity e = cmd.entity;
+    if (__ecs_entity_is_deferred(e))
+    {
+        e = __ecs_entity_deferred_index(e);
+    }
+
     switch (cmd.kind)                                                                        
-    {                                                                                        
+    {
         case __ECS_COMMAND_DESTORY_ENTITY:                                                   
         {                                                                                    
-            __ecs_world_destory_entity_immediate(world, cmd.entity);                         
+            __ecs_world_destory_entity_immediate(world, e);                         
         }                                                                                    
         break;                                                                               
         case __ECS_COMMAND_ADD_COMPONENT:                                                    
@@ -696,7 +732,7 @@ void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* 
             __ECS_ComponentStorage* storage = &world->components[*id];                       
             __ecs_component_storage_add(                                                     
                 storage,                                                                     
-                cmd.entity,                                                                  
+                e,                                                                  
                 __ecs_command_buffer_pop(cb, storage->component_size)                        
             );                                                                               
         }                                                                                    
@@ -707,22 +743,40 @@ void __ecs_command_handle(World* world, __ECS_Command cmd, __ECS_CommandBuffer* 
             __ECS_ComponentStorage* storage = &world->components[*id];                       
             __ecs_component_storage_remove(                                                  
                 storage,                                                                     
-                cmd.entity                                                                   
+                e                                                                   
             );                                                                               
         }                                                                                    
         break;                                                                               
         default:                                                                             
             assert(0 && "UNKNOWN COMMAND");                                                  
     }                                                                                        
-}     
-                                                                                       
+}
+ 
+Entity* __ecs_command_buffer_prepare_deferred_entities(__ECS_CommandBuffer* cmd, World* world)
+{
+    Entity* resolved = malloc(sizeof(Entity) * cmd->next_entity);
+    assert(resolved != NULL);
+    for (Entity i = 0; i < cmd->next_entity; i++)
+    {
+        resolved[i] = world_create_entity(world);
+    }
+
+    return resolved;
+}
+
 void __ecs_command_buffer_drain(World* world, __ECS_CommandBuffer* cb)                       
-{                                                                                            
-    while (cb->start < cb->size)                                                             
-    {                                                                                        
-        __ECS_Command* cmd = __ecs_command_buffer_pop(cb, sizeof(__ECS_Command));            
+{
+
+    Entity* resolved = __ecs_command_buffer_prepare_deferred_entities(cb, world);
+    assert(resolved != NULL);
+
+    while (cb->start < cb->size)
+    {
+        __ECS_Command* cmd = __ecs_command_buffer_pop(cb, sizeof(__ECS_Command));
         __ecs_command_handle(world, *cmd, cb);                                               
-    }                                                                                        
+    }
+
+    free(resolved);
 }                                                                                            
 
 void __ecs_command_buffer_remove_component(                                                  
@@ -740,9 +794,29 @@ void __ecs_command_buffer_remove_component(
     __ecs_command_buffer_push(cb, &id, sizeof(id));                                          
 }
 
-void entity_destroy(World* world, Entity e)
-{ 
-    __ecs_command_buffer_destroy_entity(&world->cmd_buffer, e);
+static Entity __ecs_make_deferred_entity(uint32_t local_index)
+{
+    return (Entity){ __ECS_ENTITY_DEFERRED_BIT | local_index };
+}
+
+static int __ecs_entity_is_deferred(Entity e)
+{
+    return (e & __ECS_ENTITY_DEFERRED_BIT) != 0;
+}
+
+static uint32_t __ecs_entity_deferred_index(Entity e)
+{
+    return e & ~__ECS_ENTITY_DEFERRED_BIT;
+}
+
+static void cmd_destroy_entity(__ECS_CommandBuffer* cmd, Entity e)
+{   
+    __ecs_command_buffer_destroy_entity(cmd, e);
+}
+
+static Entity cmd_create_entity(__ECS_CommandBuffer* cmd)
+{   
+    return __ecs_make_deferred_entity(cmd->next_entity++);
 }
 
 void* __ecs_command_buffer_pop(__ECS_CommandBuffer* cb, size_t size)
@@ -782,6 +856,11 @@ void __ecs_command_buffer_destroy_entity(__ECS_CommandBuffer* cb, Entity e)
     __ecs_command_buffer_push(cb, &cmd, sizeof(cmd));
 }
 
+void __ecs_command_buffer_free(__ECS_CommandBuffer* cmd)
+{
+    free(cmd->buffer);
+}
+
 // ########################### COMMANDS #############################
 
 // ############################ SYSTEM ###############################
@@ -813,7 +892,7 @@ static const __ECS_ComponentID* __ecs_system_get_query(const __ECS_SystemDescrip
     return self->system_query;
 }
 
-static const size_t __ecs_system_get_query_len(const __ECS_SystemDescription* self)
+static size_t __ecs_system_get_query_len(const __ECS_SystemDescription* self)
 {
     if (self == NULL) return 0;
     return self->query_len;
@@ -832,8 +911,6 @@ static __ECS_ScheduleResult __ecs_build_schedule(
     if (system_count == 0) {
         return __ECS_SCHEDULE_OK;
     }
-
-    printf("System Count: %u\n", system_count);
 
     uint8_t *edges = calloc(system_count * system_count, sizeof(uint8_t));
     uint32_t *in_degree = calloc(system_count, sizeof(uint32_t));
@@ -866,8 +943,6 @@ static __ECS_ScheduleResult __ecs_build_schedule(
             in_degree[__to]++;                                     \
         }                                                          \
     } while (0)
-
-    
 
     for (uint32_t system_index = 0; system_index < system_count; system_index++) {
         const __ECS_SystemDescription* system = &systems[system_index];
@@ -1013,8 +1088,7 @@ static __ECS_ScheduleResult __ecs_build_schedule(
     free(in_degree);
     free(scheduled);
 
-    __ECS_ScheduleBatch *shrunk =
-        realloc(batches, sizeof(__ECS_ScheduleBatch) * batch_count);
+    __ECS_ScheduleBatch *shrunk = realloc(batches, sizeof(__ECS_ScheduleBatch) * batch_count);
 
     if (shrunk) {
         batches = shrunk;
@@ -1059,6 +1133,15 @@ static __ECS_ScheduleResult __ecs_build_schedule(
     }
 
     return __ECS_SCHEDULE_OK;
+}
+
+void __ecs_schedule_free(__ECS_Schedule* schedule)
+{
+    for (uint32_t i = 0; i < schedule->count; i++)
+    {
+        free(schedule->batches[i].systems);
+    }
+    free(schedule->batches);
 }
 // ############################ SYSTEM ###############################
 
